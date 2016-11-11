@@ -25,16 +25,36 @@
 #include <helper_cuda.h>
 #include <helper_functions.h>
 #endif
-
+//#define DEBUG
 #define CUDA_TIMING
-#define BLOCK_SIZE 4 // the actual configured block size
+#ifndef DEBUG
+#define BLOCK_SIZE 1024 // the actual configured block size
+#else
+#define BLOCK_SIZE 4
+#endif
 
-__host__ void printVector(unsigned int *vector, int numElements) {
+/**
+* Prints a float vector, with numElements the number of elements in the vector and vectorName, the vector variable name.
+*/
+__host__ void printVector(float *vector, int numElements, char *vectorName) {
 	for (int i = 0; i < numElements; i++) {
-		printf("Value of vector at index %d is %d\n", i, vector[i]);
+		printf("Value of %s at index %d is %f\n", vectorName, i, vector[i]);
 	}
 }
 
+/**
+* Prints an int vector, with numElements the number of elements in the vector and vectorName, the vector variable name.
+*/
+__host__ void printVector(unsigned int *vector, int numElements, char *vectorName) {
+	for (int i = 0; i < numElements; i++) {
+		printf("Value of %s at index %d is %d\n", vectorName, i, vector[i]);
+	}
+}
+
+/**
+* Initialise a given vector with random numbers between 0 and 9 where numElements is the number of elements 
+* in the vector.
+*/
 __host__ void initialiseSmallVector(unsigned int *vector, int numElements) {
 	srand(time(NULL));
 	for (int i = 0; i < numElements; i++) {
@@ -43,12 +63,48 @@ __host__ void initialiseSmallVector(unsigned int *vector, int numElements) {
 }
 
 /**
-* CUDA Kernel Device code
-*
-* Computes the cumulative sum of the vector X and it passes the result into the vector Y. The 2 vectors have the same
-* number of elements numElements.
+* Computes the sequential scan of a vector.
 */
+__host__ unsigned int *sequentialScan(unsigned int *vector, unsigned int *output, int numElements) {
+	int cumulativeSum = 0;
+	for (int i = 0; i < numElements; i++) {
+		cumulativeSum += vector[i];
+		output[i] = cumulativeSum;
+	}
+	return output;
+}
 
+/**
+* Computes the sequential windowed Average with a given scanned vector.
+*/
+__host__ float *calcScannedWindowedAverage(unsigned int *scannedVector, float *output, int windowSize, int numElements) {
+	int subIndex;
+	for (int i = 0; i < numElements; i++) {
+		subIndex = i - windowSize;
+		if (subIndex < 0) 
+			output[i] = (float)scannedVector[i] / windowSize;
+		else
+			output[i] = (float)(scannedVector[i] - scannedVector[subIndex]) / windowSize;
+	}
+	return output;
+}
+/**
+* Computes the Windowed average of a given vector sequentially on the host. vector is the vector that the windowed
+* average will be calculated on. output is the vector to store the result of the windowed average.
+* windowSize is the size of the window for the average and numElements is the number of elements in both vectors.
+*/
+__host__ float *sequentialWindowedAverage(unsigned int *vector, float *output, int windowSize, int numElements) {
+	unsigned int *scannedVector = (unsigned int*)malloc(numElements * sizeof(int));
+	scannedVector = sequentialScan(vector, scannedVector, numElements);
+	output = calcScannedWindowedAverage(scannedVector, output, windowSize, numElements);
+	return output;
+}
+
+/**
+* Computes the cumulative sum of the vector X and it passes the result into the vector Y. The 2 vectors have the same
+* number of elements numElements. extractedSum is the vector where the values at the end of each block will be placed.
+* extractSum is a boolean to say if we wish to extract the values at the end of each block or not.
+*/
 __global__ void blockScan(unsigned int *X, unsigned int *Y, unsigned int len, unsigned int *extractedSum, boolean extractSum) {
 	__shared__ unsigned int XY[BLOCK_SIZE];
 	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -71,16 +127,37 @@ __global__ void blockScan(unsigned int *X, unsigned int *Y, unsigned int len, un
 		Y[i] = XY[threadIdx.x];
 
 	if (extractSum) {
-		printf("@thread %d\n", threadIdx.x);
 		if (threadIdx.x == BLOCK_SIZE - 1) {
-			printf("Inserting into extractedSum[%d]\n", blockIdx.x);
 			extractedSum[blockIdx.x] = XY[threadIdx.x];
 		}
 	}
 }
 
-__global__ void blockAdd(unsigned int *X, unsigned int *Y, unsigned int len, unsigned int *extractedSum, boolean extractSum) {
-
+/**
+* Adds the extract vector to the output vector. extractLen is the length of the extract vector and outputLen is the 
+* length of the output vector.
+*/
+__global__ void blockAdd(unsigned int *extract, unsigned int *output, unsigned int extractLen, unsigned int outputLen) {
+	unsigned int index = (blockIdx.x + 1) * BLOCK_SIZE + threadIdx.x;
+	if (index < outputLen) {
+		output[index] = output[index] + extract[blockIdx.x];
+#ifdef DEBUG
+		printf("inserted value %d at index %d\n", output[index], index);
+#endif
+	}
+}
+/**
+* Calculates the windowed average of a scanned vector.
+*/
+__global__ void d_CalcWindowedAverage(unsigned int *scannedVector, float* output, int windowSize, int numElements) {
+	unsigned int index = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+	int subIndex = index - windowSize;
+	if (index < numElements) {
+		if(subIndex < 0) 
+			output[index] = (float) scannedVector[index] / windowSize;
+		else
+			output[index] = (float)(scannedVector[index] - scannedVector[subIndex]) / windowSize;
+	}
 }
 
 /**
@@ -88,28 +165,27 @@ __global__ void blockAdd(unsigned int *X, unsigned int *Y, unsigned int len, uns
 */
 int main(void)
 {
-	boolean debug = true;
 	// Error code to check return values for CUDA calls
 	cudaError_t err = cudaSuccess;
 
 	// Print the vector length to be used, and compute its size
-	unsigned int numElements = 1000000;
+	unsigned int numElements = 10000000;
+	int windowSize = 4;
+#ifdef DEBUG
 	unsigned int init_h_A[] = { 1,2,1,3,1,1,3,3,2,1,2,2,2,1,1,2 };
-	if (debug) {
-		numElements = 16;
-	}
+	numElements = 16;
+#endif
 	size_t size = numElements * sizeof(int);
+	size_t floatSize = numElements * sizeof(float);
 	printf("[Vector addition of %d elements]\n", numElements);
-	static const int p_init[] = { 0, 1, 2 };
-
 
 	// Allocate the host input vector A
 	unsigned int *h_A = (unsigned int *)malloc(size);
 
-	if (debug) {
-		memcpy(h_A, init_h_A, size);
-	}
-
+#ifdef DEBUG	
+	memcpy(h_A, init_h_A, size);
+#endif
+	
 	// Allocate the host output vector B
 	unsigned int *h_B = (unsigned int *)malloc(size);
 
@@ -121,19 +197,27 @@ int main(void)
 	}
 
 	// Initialise the host input vector A with Random Values
-	if(!debug)
-		initialiseSmallVector(h_A, numElements);
+#ifndef DEBUG		
+	initialiseSmallVector(h_A, numElements);
+#endif
 
-	unsigned int h_sum1Size = ceil(numElements / BLOCK_SIZE) * sizeof(int);
-	// Allocate the host output vector B
-	unsigned int *h_C = (unsigned int *)malloc(h_sum1Size);
+	// Allocate the host output vector C for debugging
+#ifdef DEBUG
+	float *h_C = (float*)malloc(floatSize);
+#endif
+	// Initialise the host output vector for the windowed average of both the parallel and sequential versions
+	float *h_windowedAverage = (float *)malloc(floatSize);
+	float *seqWindowedAverage = (float *)malloc(floatSize);
 
-	// Verify that allocations succeeded
-	if (h_C == NULL)
-	{
-		fprintf(stderr, "Failed to allocate host vectors!\n");
-		exit(EXIT_FAILURE);
-	}
+#ifdef DEBUG
+
+		// Verify that allocations succeeded
+		if (h_C == NULL)
+		{
+			fprintf(stderr, "Failed to allocate host vectors!\n");
+			exit(EXIT_FAILURE);
+		}
+#endif
 
 	// Allocate the device input vector A
 	unsigned int *d_A = NULL;
@@ -145,7 +229,7 @@ int main(void)
 		exit(EXIT_FAILURE);
 	}
 
-	// Allocate the device output vector B
+	// Allocate the device output vector B for the scan
 	unsigned int *d_B = NULL;
 	err = cudaMalloc((void **)&d_B, size);
 
@@ -155,8 +239,21 @@ int main(void)
 		exit(EXIT_FAILURE);
 	}
 
+	// Allocate the device output vector d_windowedAverage for the scan
+	float *d_windowedAverage = NULL;
+	err = cudaMalloc((void **)&d_windowedAverage, floatSize);
+
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "Failed to allocate device vector B (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+
+
 	// Define the size of the Sum1 vectors to store the extracted sum
-	unsigned int sum1Size = ceil(numElements / BLOCK_SIZE) * sizeof(int);
+	unsigned int sum1NumElems = ceil(numElements / BLOCK_SIZE);
+	unsigned int sum1Size = sum1NumElems * sizeof(int);
 	// Allocate the device vector d_Sum1 to store the extracted sum of the first level scan
 	unsigned int *d_Sum1 = NULL;
 	err = cudaMalloc((void **)&d_Sum1, sum1Size);
@@ -174,8 +271,9 @@ int main(void)
 		exit(EXIT_FAILURE);
 	}
 
-	// Define the size of the Sum1 vectors to store the extracted sum
-	unsigned int sum2Size = ceil(numElements / BLOCK_SIZE) * sizeof(int); ///NEEDS TO BE CHANGED
+	// Define the size of the Sum2 vectors to store the extracted sum
+	unsigned int sum2NumElems =  ceil(sum1NumElems/ BLOCK_SIZE);
+	unsigned int sum2Size = sum2NumElems * sizeof(int); 
 	// Allocate the device vector d_Sum1 to store the extracted sum of the first level scan
 	unsigned int *d_Sum2 = NULL;
 	err = cudaMalloc((void **)&d_Sum2, sum2Size);
@@ -184,7 +282,13 @@ int main(void)
 		fprintf(stderr, "Failed to allocate device vector Sum1 (error code %s)!\n", cudaGetErrorString(err));
 		exit(EXIT_FAILURE);
 	}
-
+	unsigned int *d_Sum2_scanned = NULL;
+	err = cudaMalloc((void **)&d_Sum2_scanned, sum2Size);
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "Failed to allocate device vector Sum1_scanned (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
 	// Copy the host input vector A into host memory to the device input vector in
 	// device memory
 	printf("Copy input data from the host memory to the CUDA device\n");
@@ -196,11 +300,11 @@ int main(void)
 		exit(EXIT_FAILURE);
 	}
 
-	// Launch the Vector Add CUDA Kernel
+	// Define number of threads per block
 	int threadsPerBlock = 1024;
-	if (debug) threadsPerBlock = 4;
-
-	// Note this pattern, based on integer division, for rounding up
+#ifdef DEBUG
+	threadsPerBlock = 4;
+#endif
 	int blocksPerGrid = 1 + ((numElements - 1) / threadsPerBlock);
 
 	printf("Launch the CUDA kernel with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
@@ -219,82 +323,102 @@ int main(void)
 
 	cudaEventRecord(start, 0);
 #endif
-	blockScan<<<blocksPerGrid, threadsPerBlock >>>(d_A, d_B, numElements, d_Sum1, true);
-	// Copy the device result vector in device memory to the host result vector
-	// in host memory.
-	if (debug) {
-		printf("Copy output data from the CUDA device to the host memory\n");
-		err = cudaMemcpy(h_C, d_Sum1, sum1Size, cudaMemcpyDeviceToHost);
-		printVector(h_C, 4);
-		printVector(d_Sum1, 4);
+#ifdef DEBUG
+	blockScan<<<blocksPerGrid, threadsPerBlock>>>(d_Sum1, d_Sum1_scanned, sum1NumElems, d_Sum1, false);
+	blockAdd<<<blocksPerGrid, threadsPerBlock >>>(d_Sum1_scanned, d_B, sum1NumElems, numElements);
+	d_WindowedAverage<<<blocksPerGrid, threadsPerBlock >>>(d_B, h_C, windowSize, numElements);
+	err = cudaMemcpy(h_C, d_B, size, cudaMemcpyDeviceToHost);
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "Failed to get elapsed time (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
 	}
-	blockScan<<<blocksPerGrid, threadsPerBlock >>>(d_Sum1, d_Sum1_scanned, sum1Size, d_Sum2, true);
-	blockScan<<<blocksPerGrid, threadsPerBlock >>>(d_Sum2, d_Sum1_scanned, sum2Size, d_Sum1, false);
+	printVector(h_C, numElements, "h_C");
+	printf("Printed vector\n");
+#endif
+#ifndef DEBUG
+	blockScan <<<blocksPerGrid, threadsPerBlock >>>(d_A, d_B, numElements, d_Sum1, true);
+	blockScan<<<blocksPerGrid, threadsPerBlock >>>(d_Sum1, d_Sum1_scanned, sum1NumElems, d_Sum2, true);
+	blockScan<<<blocksPerGrid, threadsPerBlock >>>(d_Sum2, d_Sum2_scanned, sum2NumElems, d_Sum1, false);
+	blockAdd <<<blocksPerGrid, threadsPerBlock >>>(d_Sum2_scanned, d_Sum1_scanned, sum2NumElems, sum1NumElems);
+	blockAdd <<<blocksPerGrid, threadsPerBlock >>>(d_Sum1_scanned, d_B, sum1NumElems, numElements);
+	d_CalcWindowedAverage<<<blocksPerGrid, threadsPerBlock >>>(d_B, d_windowedAverage, windowSize, numElements);
+#endif
+	// Wait for device to finish
+	cudaDeviceSynchronize();
+
+	// Stop the device timer
+#ifdef TIMING_SUPPORT
+	// stop and destroy timer
+	sdkStopTimer(&timer);
+	double dSeconds = sdkGetTimerValue(&timer) / (1000.0);
+
+
+	//Log throughput, etc
+	printf("Time = %.5f s\n", dSeconds);
+	sdkDeleteTimer(&timer);
+#endif
+
+	err = cudaGetLastError();
+
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+
+#/*ifdef CUDA_TIMING
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+
+	err = cudaEventElapsedTime(&time, start, stop);
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "Failed to get elapsed time (error code %s)!\n", cudaGetErrorString(err));
+		exit(EXIT_FAILURE);
+	}
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	printf("CUDA_TIMING: %.4f ms\n", time);
+#endif	*/
 
 
 
-	
-//#ifdef CUDA_TIMING
-//	cudaEventRecord(stop, 0);
-//	cudaEventSynchronize(stop);
-//
-//	err = cudaEventElapsedTime(&time, start, stop);
-//	if (err != cudaSuccess)
-//	{
-//		fprintf(stderr, "Failed to get elapsed time (error code %s)!\n", cudaGetErrorString(err));
-//		exit(EXIT_FAILURE);
-//	}
-//
-//	cudaEventDestroy(start);
-//	cudaEventDestroy(stop);
-//	printf("CUDA_TIMING: %.4f ms\n", time);
-//#endif
-//	// wait for device to finish
-//	cudaDeviceSynchronize();
-//
-//	err = cudaGetLastError();
-//
-//	if (err != cudaSuccess)
-//	{
-//		fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
-//		exit(EXIT_FAILURE);
-//	}
 
-
-//#ifdef TIMING_SUPPORT
-//	// stop and destroy timer
-//	sdkStopTimer(&timer);
-//	double dSeconds = sdkGetTimerValue(&timer) / (1000.0);
-//
-//
-//	//Log throughput, etc
-//	printf("Time = %.5f s\n", dSeconds);
-//	sdkDeleteTimer(&timer);
-//#endif
-//
 
 	// Copy the device result vector in device memory to the host result vector
 	// in host memory.
 	printf("Copy output data from the CUDA device to the host memory\n");
-	err = cudaMemcpy(h_B, d_B, size, cudaMemcpyDeviceToHost);
+	err = cudaMemcpy(h_windowedAverage, d_windowedAverage, floatSize, cudaMemcpyDeviceToHost);
 
 	if (err != cudaSuccess)
 	{
-		fprintf(stderr, "Failed to copy vector B from device to host (error code %s)!\n", cudaGetErrorString(err));
+		fprintf(stderr, "Failed to copy vector windowedAverage from device to host (error code %s)!\n", cudaGetErrorString(err));
 		exit(EXIT_FAILURE);
 	}
 
 	// Verify that the result vector is correct
-	/*for (int i = 0; i < numElements; ++i)
+
+	// Perform the timed sequential version of the windowed average
+
+	sequentialWindowedAverage(h_A, seqWindowedAverage, windowSize, numElements);
+#ifdef DEBUG
+	printVector(seqWindowedAverage, numElements, "windowedAverage");
+#endif
+	for (int i = 0; i < numElements; ++i)
 	{
-		if (fabs(h_A[i] + h_B[i]) > 1e-5)
+		if (seqWindowedAverage[i] != h_windowedAverage[i] )
 		{
 			fprintf(stderr, "Result verification failed at element %d!\n", i);
 			exit(EXIT_FAILURE);
 		}
-	}*/
+	}
 	printf("Test PASSED\n");
-	printVector(h_B, numElements);
+#ifdef DEBGUG 
+	printVector(h_B, numElements, "h_B");
+#endif
 	// Free device global memory
 	err = cudaFree(d_A);
 
@@ -314,6 +438,7 @@ int main(void)
 	// Free host memory
 	free(h_A);
 	free(h_B);
+
 
 	// Reset the device and exit
 	err = cudaDeviceReset();
